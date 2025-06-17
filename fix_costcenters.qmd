@@ -1,0 +1,99 @@
+---
+title: "Fix Cost Centers"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(glue)
+library(readxl)
+```
+
+```{r}
+fy <- 2025
+
+path_data <- glue(
+  "C:/Users",
+  "{Sys.getenv('USERNAME')}",
+  "OneDrive - District of Columbia Public Schools",
+  "DCPS Budget - Data",
+  "Personnel",
+  "485",
+  .sep = "/"
+)
+
+path_clean <- glue("{path_data}/Clean/{fy}")
+```
+
+```{r}
+data_485_wide <-
+  read_csv(
+    glue("{path_clean}/485_{fy}_wide.csv"),
+    col_types = str_c(str_dup("c", 23), str_dup("d", 105), str_dup("c", 7)),
+    na = ""
+  )
+
+data_485 <-
+  read_csv(
+    glue("{path_clean}/485_{fy}.csv"),
+    col_types = str_c(str_dup("c", 31), str_dup("d", 1), str_dup("c", 3)),
+    na = ""
+  )
+
+crosswalk <-
+  read_xlsx("crosswalk_dept_costcenter.xlsx", col_types = "text")
+```
+
+```{r}
+needs_fix <-
+  data_485 %>%
+  filter(costcenter_id != "10002") %>%
+  left_join(crosswalk, by = join_by(department_id)) %>%
+  filter(costcenter_id != costcenter_id_peoplesoft)
+```
+
+```{r}
+from <-
+  needs_fix %>%
+  select(
+    agency = fund_agency,
+    fund_id,
+    program_id,
+    costcenter_id,
+    account_id,
+    project_id, award_id, task_id,
+    amount
+  ) %>%
+  mutate(subtask_id = NA_character_, .before = amount) %>%
+  rename_with(\(x) str_c("from_", x))
+
+to <-
+  needs_fix %>%
+  select(
+    agency = fund_agency,
+    fund_id,
+    program_id,
+    costcenter_id = costcenter_id_peoplesoft,
+    account_id,
+    project_id, award_id, task_id,
+    amount
+  ) %>%
+  mutate(subtask_id = NA_character_, .before = amount) %>%
+  rename_with(\(x) str_c("to_", x))
+
+journal <-
+  from %>%
+  bind_cols(to) %>%
+  mutate(blank = NA_character_, .before = "to_agency")
+```
+
+```{r}
+journal %>% write_csv("journal.csv", na = "")
+```
+
+```{r}
+data_485_wide %>%
+  filter(row_485 %in% needs_fix$row_485) %>%
+  select(!row_485) %>%
+  write_csv("supporting_485.csv", na = "")
+```
