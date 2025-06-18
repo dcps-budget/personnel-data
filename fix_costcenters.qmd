@@ -47,7 +47,8 @@ crosswalk <-
 ```{r}
 needs_fix <-
   data_485 %>%
-  filter(costcenter_id != "10002") %>%
+  filter(costcenter_id %in% crosswalk$costcenter_id_peoplesoft) %>%
+  filter(fund_id == "1010001") %>%
   left_join(crosswalk, by = join_by(department_id)) %>%
   filter(costcenter_id != costcenter_id_peoplesoft)
 ```
