@@ -40,6 +40,10 @@ data_485 <-
     na = ""
   )
 
+data_025 <-
+  read_xlsx("r025.xlsx", col_types = c(rep("text", 7), rep("numeric", 5))) %>%
+  select(agency, ends_with("_id"), available)
+
 crosswalk <-
   read_xlsx("crosswalk_dept_costcenter.xlsx", col_types = "text")
 ```
@@ -47,10 +51,11 @@ crosswalk <-
 ```{r}
 needs_fix <-
   data_485 %>%
+  left_join(crosswalk, by = join_by(department_id)) %>%
   filter(costcenter_id %in% crosswalk$costcenter_id_peoplesoft) %>%
   filter(fund_id == "1010001") %>%
-  left_join(crosswalk, by = join_by(department_id)) %>%
-  filter(costcenter_id != costcenter_id_peoplesoft)
+  filter(costcenter_id != costcenter_id_peoplesoft) %>%
+  replace_na(list(project_id = "0", award_id = "0"))
 ```
 
 ```{r}
@@ -81,20 +86,48 @@ to <-
   ) %>%
   mutate(subtask_id = NA_character_, .before = amount) %>%
   rename_with(\(x) str_c("to_", x))
-
-journal <-
-  from %>%
-  bind_cols(to) %>%
-  mutate(blank = NA_character_, .before = "to_agency")
 ```
 
 ```{r}
+available <-
+  data_025 %>%
+  rename_with(\(x) str_c("to_", x))
+```
+
+```{r}
+journal <-
+  from %>%
+  bind_cols(to) %>%
+  mutate(blank_1 = NA_character_, .before = "to_agency") %>%
+  mutate(blank_2 = NA_character_) %>%
+  mutate(to_amount_original = to_amount) %>%
+  left_join(available) %>%
+  replace_na(list(to_available = 0)) %>%
+  mutate(
+    from_amount = case_when(
+      to_available <= 0 ~ 0,
+      to_available < to_amount ~ to_available,
+      to_available >= to_amount ~ to_amount
+    ),
+    to_amount = case_when(
+      to_available <= 0 ~ 0,
+      to_available < to_amount ~ to_available,
+      to_available >= to_amount ~ to_amount
+    )
+  )
+
 journal %>% write_csv("journal.csv", na = "")
 ```
 
 ```{r}
-data_485_wide %>%
+supporting_485 <-
+  data_485_wide %>%
   filter(row_485 %in% needs_fix$row_485) %>%
-  select(!row_485) %>%
-  write_csv("supporting_485.csv", na = "")
+  select(!row_485)
+
+supporting_485 %>% write_csv("supporting_485.csv", na = "")
+```
+
+```{r}
+Sys.time()
 ```
