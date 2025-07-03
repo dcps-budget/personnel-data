@@ -54,14 +54,28 @@ available <-
   data_025 %>%
   rename(account_id_budget = account_id) %>%
   mutate(
-    spend_expected = (spend / 8) * 4,
+    spend_expected = (spend / 9) * 3,
     available_yearend = available - spend_expected
   )
+
+available_1010001 <-
+  available %>%
+  filter(fund_id == "1010001")
+
+available_1010212 <-
+  available %>%
+  filter(fund_id == "1010212") %>%
+  mutate(fund_id = "1010001")
+
+available_400476 <-
+  available %>%
+  filter(program_id == "400476")
 ```
 
 ```{r}
 needs_fix <-
   data_485 %>%
+  rename(amount_original = amount) %>%
   left_join(crosswalk, by = join_by(program_id == program_id_ge)) %>%
   filter(program_id %in% crosswalk$program_id_ge) %>%
   replace_na(list(project_id = "0", award_id = "0", task_id = "0")) %>%
@@ -69,8 +83,18 @@ needs_fix <-
     account_pref_4 == "7011" ~ "7011001",
     account_pref_4 == "7014" ~ "7014008",
     .default = account_id
-  )) %>%
-  left_join(available, by = join_by(
+  ))
+```
+
+1010212
+
+```{r}
+needs_fix_1010212 <-
+  needs_fix %>%
+  # use amount not accounted for in previous step as starting point
+  filter(amount_original > 0.00) %>%
+  # repeat this logic for each funding source
+  left_join(available_1010212, by = join_by(
     agency,
     fund_id,
     program_id_ar == program_id,
@@ -79,7 +103,6 @@ needs_fix <-
     account_id_budget
   )) %>%
   filter(available_yearend > 0.00) %>%
-  rename(amount_original = amount) %>%
   group_by(
     agency,
     fund_id,
@@ -89,12 +112,71 @@ needs_fix <-
     account_id_budget
   ) %>%
   mutate(amount_accountgroup = sum(amount_original)) %>%
+  ungroup() %>%
   mutate(multiplier = case_when(
     amount_accountgroup <= available_yearend ~ 1.00,
     .default = available_yearend / amount_accountgroup
   )) %>%
-  mutate(amount_journal = amount_original * multiplier)
+  mutate(amount_journal = amount_original * multiplier) %>%
+  mutate(leftover = amount_original - amount_journal)
+
+needs_fix_1010212
 ```
+
+1010001
+
+```{r}
+needs_fix_1010001 <-
+  needs_fix_1010212 %>%
+  mutate(amount_original = leftover) %>%
+  select(c(1:account_id_budget)) %>%
+  # use amount not accounted for in previous step as starting point
+  filter(amount_original > 0.00) %>%
+  # logic repeated for each funding source
+  left_join(available_1010001, by = join_by(
+    agency,
+    fund_id,
+    program_id_ar == program_id,
+    costcenter_id,
+    project_id, award_id,
+    account_id_budget
+  )) %>%
+  filter(available_yearend > 0.00) %>%
+  group_by(
+    agency,
+    fund_id,
+    program_id_ar,
+    costcenter_id,
+    project_id, award_id,
+    account_id_budget
+  ) %>%
+  mutate(amount_accountgroup = sum(amount_original)) %>%
+  ungroup() %>%
+  mutate(multiplier = case_when(
+    amount_accountgroup <= available_yearend ~ 1.00,
+    .default = available_yearend / amount_accountgroup
+  )) %>%
+  mutate(amount_journal = amount_original * multiplier) %>%
+  mutate(leftover = amount_original - amount_journal)
+
+needs_fix_1010001
+```
+
+400476
+
+```{r}
+needs_fix_400476 <-
+  needs_fix_1010001 %>%
+  mutate(amount_original = leftover) %>%
+  select(c(1:account_id_budget)) %>%
+  # use amount not accounted for in previous step as starting point
+  filter(amount_original > 0.00)
+# logic repeated for each funding source
+
+needs_fix_400476
+```
+
+***
 
 ```{r}
 needs_fix_rollup <-
@@ -142,27 +224,43 @@ to <-
     amount_journal
   ) %>%
   mutate(subtask_id = "0", .before = amount_journal) %>%
-  rename_with(\(x) str_c("to_", x))
+  rename_with(\(x) str_c("to_", x)) %>%
+  mutate(to_fund_id = "1010212")
 ```
 
 ```{r}
-journal <-
+journal_212 <-
   from %>%
   bind_cols(to) %>%
   bind_cols(select(needs_fix_rollup, amount_original, account_id_budget)) %>%
   mutate(blank_1 = NA_character_, .before = "to_agency") %>%
   mutate(blank_2 = NA_character_, .before = "amount_original") %>%
-  left_join(available, by = join_by(
+  left_join(available_212, by = join_by(
     to_agency == agency,
     to_fund_id == fund_id,
     to_program_id == program_id,
     to_costcenter_id == costcenter_id,
     to_project_id == project_id, to_award_id == award_id,
     account_id_budget
-  ))
+  )) %>%
+  mutate(left_after_212 = amount_original - to_amount_journal)
 
-journal %>% write_csv("journal.csv", na = "")
+journal_212 %>% write_csv("journal_212.csv", na = "")
+
+journal_212
 ```
+
+1010001
+
+```{r}
+needs_fix_001 <-
+  journal_212 %>%
+  filter(left_after_212 > 0)
+
+needs_fix_001
+```
+
+***
 
 ```{r}
 supporting_485 <-
