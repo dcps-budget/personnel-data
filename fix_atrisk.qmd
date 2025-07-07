@@ -45,8 +45,12 @@ data_025 <-
   read_xlsx("r025.xlsx", col_types = c(rep("text", 7), rep("numeric", 9))) %>%
   select(agency, ends_with("_id"), available, spend)
 
-crosswalk <-
+crosswalk_atrisk <-
   read_xlsx("crosswalk_atrisk.xlsx", col_types = "text")
+
+crosswalk_atrisk_overage <-
+  read_xlsx("crosswalk_atrisk_overage.xlsx", col_types = "text") %>%
+  select(!amount_expense)
 ```
 
 ```{r}
@@ -56,7 +60,8 @@ available <-
   mutate(
     spend_expected = (spend / 9) * 3,
     available_yearend = available - spend_expected
-  )
+  ) %>%
+  filter(available_yearend > 0.00)
 
 available_1010001 <-
   available %>%
@@ -75,15 +80,13 @@ available_400476 <-
 ```{r}
 needs_fix <-
   data_485 %>%
-  rename(amount_original = amount) %>%
-  left_join(crosswalk, by = join_by(program_id == program_id_ge)) %>%
-  filter(program_id %in% crosswalk$program_id_ge) %>%
-  replace_na(list(project_id = "0", award_id = "0", task_id = "0")) %>%
   mutate(account_id_budget = case_when(
     account_pref_4 == "7011" ~ "7011001",
     account_pref_4 == "7014" ~ "7014008",
     .default = account_id
-  ))
+  )) %>%
+  mutate(amount_original = amount) %>%
+  replace_na(list(project_id = "0", award_id = "0", task_id = "0"))
 ```
 
 1010212
@@ -93,7 +96,10 @@ needs_fix_1010212 <-
   needs_fix %>%
   # use amount not accounted for in previous step as starting point
   filter(amount_original > 0.00) %>%
-  # repeat this logic for each funding source
+  # add columns needed for join on relevant budget table
+  left_join(crosswalk_atrisk, by = join_by(program_id == program_id_ge)) %>%
+  filter(!is.na(program_id_ar)) %>%
+  # join on relevant budget table
   left_join(available_1010212, by = join_by(
     agency,
     fund_id,
@@ -103,13 +109,14 @@ needs_fix_1010212 <-
     account_id_budget
   )) %>%
   filter(available_yearend > 0.00) %>%
+  # repeat this logic for each funding source
   group_by(
     agency,
     fund_id,
     program_id_ar,
     costcenter_id,
-    project_id, award_id,
-    account_id_budget
+    account_id_budget,
+    project_id, award_id
   ) %>%
   mutate(amount_accountgroup = sum(amount_original)) %>%
   ungroup() %>%
@@ -129,10 +136,13 @@ needs_fix_1010212
 needs_fix_1010001 <-
   needs_fix_1010212 %>%
   mutate(amount_original = leftover) %>%
-  select(c(1:account_id_budget)) %>%
+  select(c(1:amount_original)) %>%
   # use amount not accounted for in previous step as starting point
   filter(amount_original > 0.00) %>%
-  # logic repeated for each funding source
+  # add columns needed for join on relevant budget table
+  left_join(crosswalk_atrisk, by = join_by(program_id == program_id_ge)) %>%
+  filter(!is.na(program_id_ar)) %>%
+  # join on relevant budget table
   left_join(available_1010001, by = join_by(
     agency,
     fund_id,
@@ -142,13 +152,14 @@ needs_fix_1010001 <-
     account_id_budget
   )) %>%
   filter(available_yearend > 0.00) %>%
+  # logic repeated for each funding source
   group_by(
     agency,
     fund_id,
     program_id_ar,
     costcenter_id,
-    project_id, award_id,
-    account_id_budget
+    account_id_budget,
+    project_id, award_id
   ) %>%
   mutate(amount_accountgroup = sum(amount_original)) %>%
   ungroup() %>%
@@ -168,12 +179,76 @@ needs_fix_1010001
 needs_fix_400476 <-
   needs_fix_1010001 %>%
   mutate(amount_original = leftover) %>%
-  select(c(1:account_id_budget)) %>%
+  select(c(1:amount_original)) %>%
   # use amount not accounted for in previous step as starting point
-  filter(amount_original > 0.00)
-# logic repeated for each funding source
+  filter(amount_original > 0.00) %>%
+  # add columns needed for join on relevant budget table
+  left_join(crosswalk_atrisk_overage, by = join_by(
+    fund_id,
+    costcenter_id,
+    program_id == program_id_ge
+  )) %>%
+  filter(!is.na(program_id_ar)) %>%
+  # join on relevant budget table
+  left_join(available_400476, by = join_by(
+    agency,
+    fund_id,
+    program_id_ar == program_id,
+    costcenter_id,
+    project_id, award_id,
+    account_id_budget
+  )) %>%
+  filter(available_yearend > 0.00) %>%
+  # logic repeated for each funding source
+  group_by(
+    agency,
+    fund_id,
+    program_id_ar,
+    costcenter_id,
+    account_id_budget,
+    project_id, award_id
+  ) %>%
+  mutate(amount_accountgroup = sum(amount_original)) %>%
+  ungroup() %>%
+  mutate(multiplier = case_when(
+    amount_accountgroup <= available_yearend ~ 1.00,
+    .default = available_yearend / amount_accountgroup
+  )) %>%
+  mutate(amount_journal = amount_original * multiplier) %>%
+  mutate(leftover = amount_original - amount_journal)
 
 needs_fix_400476
+```
+
+Build 485
+
+```{r}
+needs_fix_combined <-
+  bind_rows(needs_fix_1010212, needs_fix_1010001, needs_fix_400476) %>%
+  group_by(row_485, account_raw) %>%
+  summarize(amount_journal = sum(amount_journal), .groups = "drop") %>%
+  mutate(across(account_raw, \(x) str_replace(x, "amt_x", "AMT-X"))) %>%
+  pivot_wider(
+    names_from = account_raw, values_from = amount_journal, names_sort = TRUE
+  )
+
+needs_fix_combined
+
+accounts_present <- names(needs_fix_combined)[2:ncol(needs_fix_combined)]
+```
+
+```{r}
+data_485_wide %>%
+  mutate(across(starts_with("AMT"), \(x) 0)) %>%
+  select(!any_of(accounts_present)) %>%
+  right_join(needs_fix_combined, by = join_by(row_485)) %>%
+  select(
+    `REPORT AGENCY`:`HR-X7196007`,
+    sort(names(.)[str_detect(names(.), "^HR-")]),
+    sort(names(.)[str_detect(names(.), "^AMT")]),
+    `Fund-Descr`:row_485
+  ) %>%
+  mutate(across(starts_with("AMT"), \(x) replace_na(x, 0.00)))
 ```
 
 ***
