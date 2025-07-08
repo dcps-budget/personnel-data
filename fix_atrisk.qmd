@@ -39,11 +39,13 @@ data_485 <-
     col_types = str_c(str_dup("c", 31), str_dup("d", 1), str_dup("c", 3)),
     na = ""
   ) %>%
-  rename(agency = fund_agency)
+  rename(agency = fund_agency) %>%
+  relocate(account_id, .after = costcenter_id)
 
 data_025 <-
   read_xlsx("r025.xlsx", col_types = c(rep("text", 7), rep("numeric", 9))) %>%
-  select(agency, ends_with("_id"), available, spend)
+  select(agency, ends_with("_id"), available, spend) %>%
+  rename_with(.fn = \(x) str_c(x, "_budget"), .cols = ends_with("id"))
 
 crosswalk_atrisk <-
   read_xlsx("crosswalk_atrisk.xlsx", col_types = "text")
@@ -53,23 +55,28 @@ crosswalk_atrisk_overage <-
   select(!amount_expense)
 
 reprogramming <-
-  read_xlsx("reprogramming.xlsx", col_types = c(rep("text", 7), "numeric"))
+  read_xlsx("reprogramming.xlsx", col_types = c(rep("text", 7), "numeric")) %>%
+  rename_with(.fn = \(x) str_c(x, "_budget"), .cols = ends_with("id"))
 ```
 
 ```{r}
 available <-
   data_025 %>%
-  left_join(reprogramming) %>%
+  # reduce budget amounts by pending reprogramming
+  left_join(
+    reprogramming,
+    by = join_by(
+      agency, fund_id_budget, program_id_budget, costcenter_id_budget,
+      account_id_budget, project_id_budget, award_id_budget
+    )
+  ) %>%
   replace_na(list(change = 0.00)) %>%
   mutate(available = available + change) %>%
   select(!change) %>%
-  rename(
-    fund_id_budget = fund_id,
-    account_id_budget = account_id,
-    spend_todate = spend,
-  ) %>%
+  #
+  rename(spend_todate = spend) %>%
   mutate(
-    spend_addl_expected = (spend_todate / 9) * 3,
+    spend_addl_expected = (spend_todate / 9.0) * 3.0,
     available_yearend = available - spend_addl_expected
   ) %>%
   filter(available_yearend > 0.00)
@@ -84,20 +91,61 @@ available_1010001 <-
 
 available_400476 <-
   available %>%
-  filter(program_id == "400476")
+  filter(program_id_budget == "400476")
 ```
+
+Calculate journal amounts for each line of 485
 
 ```{r}
 needs_fix <-
   data_485 %>%
-  mutate(account_id_budget = case_when(
-    account_pref_4 == "7011" ~ "7011001",
-    account_pref_4 == "7014" ~ "7014008",
-    .default = account_id
-  )) %>%
+  mutate(
+    fund_id_budget = fund_id,
+    program_id_budget = program_id,
+    costcenter_id_budget = costcenter_id,
+    account_id_budget = case_when(
+      account_pref_4 == "7011" ~ "7011001",
+      account_pref_4 == "7014" ~ "7014008",
+      .default = account_id
+    ),
+    project_id_budget = project_id,
+    award_id_budget = award_id,
+    task_id_budget = task_id
+  ) %>%
   mutate(amount_original = amount) %>%
   filter(amount_original > 0.00) %>%
-  replace_na(list(project_id = "0", award_id = "0", task_id = "0"))
+  replace_na(
+    list(
+      project_id = "0", project_id_budget = "0",
+      award_id = "0", award_id_budget = "0",
+      task_id = "0", task_id_budget = "0"
+    )
+  )
+```
+
+Functions
+
+```{r}
+jrnl_amt <- function(x, budget) {
+  x %>%
+    left_join(budget, by = join_by(
+      agency, fund_id_budget, program_id_budget, costcenter_id_budget,
+      account_id_budget, project_id_budget, award_id_budget
+    )) %>%
+    filter(available_yearend > 0.00) %>%
+    group_by(
+      agency, fund_id_budget, program_id_budget, costcenter_id_budget,
+      account_id_budget, project_id_budget, award_id_budget
+    ) %>%
+    mutate(amount_accountgroup = sum(amount_original)) %>%
+    ungroup() %>%
+    mutate(multiplier = case_when(
+      amount_accountgroup <= available_yearend ~ 1.00,
+      .default = available_yearend / amount_accountgroup
+    )) %>%
+    mutate(amount_journal = amount_original * multiplier) %>%
+    mutate(leftover = amount_original - amount_journal)
+}
 ```
 
 1010212
@@ -109,49 +157,27 @@ needs_fix_1010212 <-
   left_join(crosswalk_atrisk, by = join_by(program_id == program_id_ge)) %>%
   filter(!is.na(program_id_ar)) %>%
   # join on relevant budget table
-  mutate(fund_id_budget = "1010212") %>%
-  left_join(available_1010212, by = join_by(
-    agency,
-    fund_id_budget,
-    program_id_ar == program_id,
-    costcenter_id,
-    project_id, award_id,
-    account_id_budget
-  )) %>%
-  filter(available_yearend > 0.00) %>%
-  # repeat this logic for each funding source
-  group_by(
-    agency,
-    fund_id_budget,
-    program_id_ar,
-    costcenter_id,
-    account_id_budget,
-    project_id, award_id
-  ) %>%
-  mutate(amount_accountgroup = sum(amount_original)) %>%
-  ungroup() %>%
-  mutate(multiplier = case_when(
-    amount_accountgroup <= available_yearend ~ 1.00,
-    .default = available_yearend / amount_accountgroup
-  )) %>%
-  mutate(amount_journal = amount_original * multiplier) %>%
-  mutate(leftover = amount_original - amount_journal)
+  mutate(fund_id_budget = "1010212", program_id_budget = program_id_ar) %>%
+  jrnl_amt(available_1010212)
 
 leftover_1010212 <-
   needs_fix_1010212 %>%
   select(
-    row_485,
-    fund_id, program_id, costcenter_id,
-    project_id, award_id,
-    account_id,
+    row_485, agency, fund_id, program_id, costcenter_id,
+    account_id, project_id, award_id,
     leftover
   )
 ```
 
+Reduce starting amounts based on previous step
+
 ```{r}
 needs_fix <-
   needs_fix %>%
-  left_join(leftover_1010212) %>%
+  left_join(leftover_1010212, by = join_by(
+    row_485, agency, fund_id, program_id, costcenter_id,
+    account_id, project_id, award_id
+  )) %>%
   mutate(
     amount_original = if_else(!is.na(leftover), leftover, amount_original)
   ) %>%
@@ -168,49 +194,27 @@ needs_fix_1010001 <-
   left_join(crosswalk_atrisk, by = join_by(program_id == program_id_ge)) %>%
   filter(!is.na(program_id_ar)) %>%
   # join on relevant budget table
-  mutate(fund_id_budget = "1010001") %>%
-  left_join(available_1010001, by = join_by(
-    agency,
-    fund_id_budget,
-    program_id_ar == program_id,
-    costcenter_id,
-    project_id, award_id,
-    account_id_budget
-  )) %>%
-  filter(available_yearend > 0.00) %>%
-  # logic repeated for each funding source
-  group_by(
-    agency,
-    fund_id_budget,
-    program_id_ar,
-    costcenter_id,
-    account_id_budget,
-    project_id, award_id
-  ) %>%
-  mutate(amount_accountgroup = sum(amount_original)) %>%
-  ungroup() %>%
-  mutate(multiplier = case_when(
-    amount_accountgroup <= available_yearend ~ 1.00,
-    .default = available_yearend / amount_accountgroup
-  )) %>%
-  mutate(amount_journal = amount_original * multiplier) %>%
-  mutate(leftover = amount_original - amount_journal)
+  mutate(fund_id_budget = "1010001", program_id_budget = program_id_ar) %>%
+  jrnl_amt(available_1010001)
 
 leftover_1010001 <-
   needs_fix_1010001 %>%
   select(
-    row_485,
-    fund_id, program_id, costcenter_id,
-    project_id, award_id,
-    account_id,
+    row_485, agency, fund_id, program_id, costcenter_id,
+    account_id, project_id, award_id,
     leftover
   )
 ```
 
+Reduce starting amounts based on previous step
+
 ```{r}
 needs_fix <-
   needs_fix %>%
-  left_join(leftover_1010001) %>%
+  left_join(leftover_1010001, by = join_by(
+    row_485, agency, fund_id, program_id, costcenter_id,
+    account_id, project_id, award_id
+  )) %>%
   mutate(
     amount_original = if_else(!is.na(leftover), leftover, amount_original)
   ) %>%
@@ -225,44 +229,17 @@ needs_fix_400476 <-
   needs_fix %>%
   # add columns needed for join on relevant budget table
   left_join(crosswalk_atrisk_overage, by = join_by(
-    fund_id,
-    costcenter_id,
-    program_id == program_id_ge
+    fund_id, costcenter_id, program_id == program_id_ge
   )) %>%
   filter(!is.na(program_id_ar)) %>%
   # join on relevant budget table
-  mutate(fund_id_budget = fund_id) %>%
-  left_join(available_400476, by = join_by(
-    agency,
-    fund_id_budget,
-    program_id_ar == program_id,
-    costcenter_id,
-    project_id, award_id,
-    account_id_budget
-  )) %>%
-  filter(available_yearend > 0.00) %>%
-  # logic repeated for each funding source
-  group_by(
-    agency,
-    fund_id_budget,
-    program_id_ar,
-    costcenter_id,
-    account_id_budget,
-    project_id, award_id
-  ) %>%
-  mutate(amount_accountgroup = sum(amount_original)) %>%
-  ungroup() %>%
-  mutate(multiplier = case_when(
-    amount_accountgroup <= available_yearend ~ 1.00,
-    .default = available_yearend / amount_accountgroup
-  )) %>%
-  mutate(amount_journal = amount_original * multiplier) %>%
-  mutate(leftover = amount_original - amount_journal)
+  mutate(program_id_budget = program_id_ar) %>%
+  jrnl_amt(available_400476)
+
+# don't need to update amounts after last step
 ```
 
-***
-
-Build 485
+Build supporting 485
 
 ```{r}
 needs_fix_combined <-
@@ -296,222 +273,110 @@ supporting_485 <-
 supporting_485 %>% write_csv("supporting_485.csv", na = "")
 ```
 
-Journal entries
+Generate journal entries
+
+Functions
+
+```{r}
+jrnl_rollup <- function(x) {
+  x %>%
+    group_by(
+      agency,
+      fund_id, fund_id_budget,
+      program_id, program_id_budget,
+      costcenter_id,
+      account_id, account_id_budget,
+      project_id, award_id, task_id,
+    ) %>%
+    summarize(
+      amount_journal = sum(amount_journal),
+      amount_original = sum(amount_original),
+      .groups = "drop"
+    )
+}
+
+jrnl_from <- function(x) {
+  x %>%
+    select(
+      agency,
+      fund_id,
+      program_id,
+      costcenter_id,
+      account_id,
+      project_id, award_id, task_id,
+      amount_journal
+    ) %>%
+    mutate(subtask_id = "0", .after = task_id) %>%
+    rename_with(\(x) str_c("from_", x))
+}
+
+jrnl_to <- function(x) {
+  x %>%
+    select(
+      agency,
+      fund_id = fund_id_budget,
+      program_id = program_id_budget,
+      costcenter_id,
+      # journal to detailed account, not budget account
+      account_id,
+      project_id, award_id, task_id,
+      amount_journal
+    ) %>%
+    mutate(subtask_id = "0", .after = task_id) %>%
+    rename_with(\(x) str_c("to_", x))
+}
+
+jrnl_journal <- function(x, budget, step) {
+  rollup <- jrnl_rollup(x)
+
+  from <- jrnl_from(rollup)
+  to <- jrnl_to(rollup)
+
+  bind_cols(from, to) %>%
+    bind_cols(select(rollup, account_id_budget, amount_original)) %>%
+    mutate(blank_1 = NA_character_, .before = "to_agency") %>%
+    mutate(blank_2 = NA_character_, .before = "account_id_budget") %>%
+    left_join(budget, by = join_by(
+      to_agency == agency,
+      to_fund_id == fund_id_budget,
+      to_program_id == program_id_budget,
+      to_costcenter_id == costcenter_id_budget,
+      to_project_id == project_id_budget, to_award_id == award_id_budget,
+      account_id_budget
+    )) %>%
+    mutate(leftover = amount_original - to_amount_journal) %>%
+    mutate(step = step, .after = blank_2)
+}
+```
 
 1010212
 
 ```{r}
-journal_rollup_1010212 <-
-  needs_fix_1010212 %>%
-  group_by(
-    agency,
-    fund_id, fund_id_budget,
-    program_id, program_id_ar,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    account_id_budget
-  ) %>%
-  summarize(
-    amount_journal = sum(amount_journal),
-    amount_original = sum(amount_original),
-    .groups = "drop"
-  )
-```
-
-```{r}
-from <-
-  journal_rollup_1010212 %>%
-  select(
-    agency,
-    fund_id,
-    program_id,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    amount_journal
-  ) %>%
-  mutate(subtask_id = "0", .before = amount_journal) %>%
-  rename_with(\(x) str_c("from_", x))
-
-to <-
-  journal_rollup_1010212 %>%
-  select(
-    agency,
-    fund_id = fund_id_budget,
-    program_id = program_id_ar,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    amount_journal
-  ) %>%
-  mutate(subtask_id = "0", .before = amount_journal) %>%
-  rename_with(\(x) str_c("to_", x))
-```
-
-```{r}
 journal_1010212 <-
-  from %>%
-  bind_cols(to) %>%
-  bind_cols(
-    select(journal_rollup_1010212, account_id_budget, amount_original)
-  ) %>%
-  mutate(blank_1 = NA_character_, .before = "to_agency") %>%
-  mutate(blank_2 = NA_character_, .before = "account_id_budget") %>%
-  left_join(available_1010212, by = join_by(
-    to_agency == agency,
-    to_fund_id == fund_id_budget,
-    to_program_id == program_id,
-    to_costcenter_id == costcenter_id,
-    to_project_id == project_id, to_award_id == award_id,
-    account_id_budget
-  )) %>%
-  mutate(leftover = amount_original - to_amount_journal) %>%
-  mutate(step = "1010212", .after = blank_2)
+  jrnl_journal(
+    needs_fix_1010212,
+    budget = available_1010212, step = "1010212"
+  )
 ```
 
 1010001
 
 ```{r}
-journal_rollup_1010001 <-
-  needs_fix_1010001 %>%
-  group_by(
-    agency,
-    fund_id, fund_id_budget,
-    program_id, program_id_ar,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    account_id_budget
-  ) %>%
-  summarize(
-    amount_journal = sum(amount_journal),
-    amount_original = sum(amount_original),
-    .groups = "drop"
-  )
-```
-
-```{r}
-from <-
-  journal_rollup_1010001 %>%
-  select(
-    agency,
-    fund_id,
-    program_id,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    amount_journal
-  ) %>%
-  mutate(subtask_id = "0", .before = amount_journal) %>%
-  rename_with(\(x) str_c("from_", x))
-
-to <-
-  journal_rollup_1010001 %>%
-  select(
-    agency,
-    fund_id = fund_id_budget,
-    program_id = program_id_ar,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    amount_journal
-  ) %>%
-  mutate(subtask_id = "0", .before = amount_journal) %>%
-  rename_with(\(x) str_c("to_", x))
-```
-
-```{r}
 journal_1010001 <-
-  from %>%
-  bind_cols(to) %>%
-  bind_cols(
-    select(journal_rollup_1010001, account_id_budget, amount_original)
-  ) %>%
-  mutate(blank_1 = NA_character_, .before = "to_agency") %>%
-  mutate(blank_2 = NA_character_, .before = "account_id_budget") %>%
-  left_join(available_1010001, by = join_by(
-    to_agency == agency,
-    to_fund_id == fund_id_budget,
-    to_program_id == program_id,
-    to_costcenter_id == costcenter_id,
-    to_project_id == project_id, to_award_id == award_id,
-    account_id_budget
-  )) %>%
-  mutate(leftover = amount_original - to_amount_journal) %>%
-  mutate(step = "1010001", .after = blank_2)
+  jrnl_journal(
+    needs_fix_1010001,
+    budget = available_1010001, step = "1010001"
+  )
 ```
 
 400476
 
 ```{r}
-journal_rollup_400476 <-
-  needs_fix_400476 %>%
-  group_by(
-    agency,
-    fund_id, fund_id_budget,
-    program_id, program_id_ar,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    account_id_budget
-  ) %>%
-  summarize(
-    amount_journal = sum(amount_journal),
-    amount_original = sum(amount_original),
-    .groups = "drop"
-  )
-```
-
-```{r}
-from <-
-  journal_rollup_400476 %>%
-  select(
-    agency,
-    fund_id,
-    program_id,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    amount_journal
-  ) %>%
-  mutate(subtask_id = "0", .before = amount_journal) %>%
-  rename_with(\(x) str_c("from_", x))
-
-to <-
-  journal_rollup_400476 %>%
-  select(
-    agency,
-    fund_id = fund_id_budget,
-    program_id = program_id_ar,
-    costcenter_id,
-    account_id,
-    project_id, award_id, task_id,
-    amount_journal
-  ) %>%
-  mutate(subtask_id = "0", .before = amount_journal) %>%
-  rename_with(\(x) str_c("to_", x))
-```
-
-```{r}
 journal_400476 <-
-  from %>%
-  bind_cols(to) %>%
-  bind_cols(
-    select(journal_rollup_400476, account_id_budget, amount_original)
-  ) %>%
-  mutate(blank_1 = NA_character_, .before = "to_agency") %>%
-  mutate(blank_2 = NA_character_, .before = "account_id_budget") %>%
-  left_join(available_400476, by = join_by(
-    to_agency == agency,
-    to_fund_id == fund_id_budget,
-    to_program_id == program_id,
-    to_costcenter_id == costcenter_id,
-    to_project_id == project_id, to_award_id == award_id,
-    account_id_budget
-  )) %>%
-  mutate(leftover = amount_original - to_amount_journal) %>%
-  mutate(step = "400476", .after = blank_2)
+  jrnl_journal(
+    needs_fix_400476,
+    budget = available_400476, step = "400476"
+  )
 ```
 
 Combined
@@ -535,9 +400,11 @@ Sys.time()
 journal %>%
   pull(from_amount_journal) %>%
   sum()
+
 journal %>%
   pull(to_amount_journal) %>%
   sum()
+
 supporting_485 %>%
   pull(AMTTOT) %>%
   sum()
