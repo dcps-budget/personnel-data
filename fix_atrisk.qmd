@@ -9,6 +9,8 @@ library(glue)
 library(readxl)
 ```
 
+Setup
+
 ```{r}
 fy <- 2025
 
@@ -24,6 +26,8 @@ path_data <- glue(
 
 path_clean <- glue("{path_data}/Clean/{fy}")
 ```
+
+Input files
 
 ```{r}
 data_485_wide <-
@@ -44,57 +48,73 @@ data_485 <-
 
 data_025 <-
   read_xlsx("r025.xlsx", col_types = c(rep("text", 7), rep("numeric", 9))) %>%
-  select(agency, ends_with("_id"), available, spend) %>%
+  select(agency, ends_with("_id"), available, spend_todate = spend) %>%
+  rename_with(.fn = \(x) str_c(x, "_budget"), .cols = ends_with("id"))
+
+reprogramming <-
+  read_xlsx("reprogramming.xlsx", col_types = c(rep("text", 7), "numeric")) %>%
   rename_with(.fn = \(x) str_c(x, "_budget"), .cols = ends_with("id"))
 
 crosswalk_atrisk <-
   read_xlsx("crosswalk_atrisk.xlsx", col_types = "text")
 
 crosswalk_atrisk_overage <-
-  read_xlsx("crosswalk_atrisk_overage.xlsx", col_types = "text") %>%
-  select(!amount_expense)
-
-reprogramming <-
-  read_xlsx("reprogramming.xlsx", col_types = c(rep("text", 7), "numeric")) %>%
-  rename_with(.fn = \(x) str_c(x, "_budget"), .cols = ends_with("id"))
+  read_xlsx("crosswalk_atrisk_overage.xlsx", col_types = "text")
 ```
+
+Project spending into remaining months and filter for relevant budgets
 
 ```{r}
 available <-
   data_025 %>%
   # reduce budget amounts by pending reprogramming
-  left_join(
-    reprogramming,
-    by = join_by(
-      agency, fund_id_budget, program_id_budget, costcenter_id_budget,
-      account_id_budget, project_id_budget, award_id_budget
-    )
-  ) %>%
+  left_join(reprogramming, by = join_by(
+    agency, fund_id_budget, program_id_budget, costcenter_id_budget,
+    account_id_budget, project_id_budget, award_id_budget
+  )) %>%
   replace_na(list(change = 0.00)) %>%
   mutate(available = available + change) %>%
   select(!change) %>%
   #
-  rename(spend_todate = spend) %>%
   mutate(
     spend_addl_expected = (spend_todate / 9.0) * 3.0,
     available_yearend = available - spend_addl_expected
   ) %>%
   filter(available_yearend > 0.00)
 
-available_1010212 <-
-  available %>%
-  filter(fund_id_budget == "1010212")
-
-available_1010001 <-
-  available %>%
-  filter(fund_id_budget == "1010001")
-
-available_400476 <-
-  available %>%
-  filter(program_id_budget == "400476")
+available_1010212 <- available %>% filter(fund_id_budget == "1010212")
+available_1010001 <- available %>% filter(fund_id_budget == "1010001")
+available_400476 <- available %>% filter(program_id_budget == "400476")
 ```
 
 Calculate journal amounts for each line of 485
+
+Functions
+
+```{r}
+jrnl_amt <- function(x, budget) {
+  x %>%
+    left_join(budget, by = join_by(
+      agency, fund_id_budget, program_id_budget, costcenter_id_budget,
+      account_id_budget, project_id_budget, award_id_budget
+    )) %>%
+    filter(available_yearend > 0.00) %>%
+    group_by(
+      agency, fund_id_budget, program_id_budget, costcenter_id_budget,
+      account_id_budget, project_id_budget, award_id_budget
+    ) %>%
+    mutate(amount_accountgroup = sum(amount_original)) %>%
+    ungroup() %>%
+    mutate(multiplier = case_when(
+      amount_accountgroup <= available_yearend ~ 1.00,
+      .default = available_yearend / amount_accountgroup
+    )) %>%
+    mutate(amount_journal = amount_original * multiplier) %>%
+    mutate(leftover = amount_original - amount_journal)
+}
+```
+
+Prepare 485 records for joining on budget lines
 
 ```{r}
 needs_fix <-
@@ -121,31 +141,6 @@ needs_fix <-
       task_id = "0", task_id_budget = "0"
     )
   )
-```
-
-Functions
-
-```{r}
-jrnl_amt <- function(x, budget) {
-  x %>%
-    left_join(budget, by = join_by(
-      agency, fund_id_budget, program_id_budget, costcenter_id_budget,
-      account_id_budget, project_id_budget, award_id_budget
-    )) %>%
-    filter(available_yearend > 0.00) %>%
-    group_by(
-      agency, fund_id_budget, program_id_budget, costcenter_id_budget,
-      account_id_budget, project_id_budget, award_id_budget
-    ) %>%
-    mutate(amount_accountgroup = sum(amount_original)) %>%
-    ungroup() %>%
-    mutate(multiplier = case_when(
-      amount_accountgroup <= available_yearend ~ 1.00,
-      .default = available_yearend / amount_accountgroup
-    )) %>%
-    mutate(amount_journal = amount_original * multiplier) %>%
-    mutate(leftover = amount_original - amount_journal)
-}
 ```
 
 1010212
@@ -334,8 +329,8 @@ jrnl_journal <- function(x, budget, step) {
 
   bind_cols(from, to) %>%
     bind_cols(select(rollup, account_id_budget, amount_original)) %>%
-    mutate(blank_1 = NA_character_, .before = "to_agency") %>%
-    mutate(blank_2 = NA_character_, .before = "account_id_budget") %>%
+    mutate(blank_1 = NA_character_, .after = "from_amount_journal") %>%
+    mutate(blank_2 = NA_character_, .after = "to_amount_journal") %>%
     left_join(budget, by = join_by(
       to_agency == agency,
       to_fund_id == fund_id_budget,
@@ -345,7 +340,11 @@ jrnl_journal <- function(x, budget, step) {
       account_id_budget
     )) %>%
     mutate(leftover = amount_original - to_amount_journal) %>%
-    mutate(step = step, .after = blank_2)
+    mutate(step = step, .after = blank_2) %>%
+    arrange(
+      from_costcenter_id, from_program_id, from_account_id,
+      to_costcenter_id, to_fund_id, to_program_id, to_account_id
+    )
 }
 ```
 
@@ -353,41 +352,27 @@ jrnl_journal <- function(x, budget, step) {
 
 ```{r}
 journal_1010212 <-
-  jrnl_journal(
-    needs_fix_1010212,
-    budget = available_1010212, step = "1010212"
-  )
+  jrnl_journal(needs_fix_1010212, budget = available_1010212, step = "1010212")
 ```
 
 1010001
 
 ```{r}
 journal_1010001 <-
-  jrnl_journal(
-    needs_fix_1010001,
-    budget = available_1010001, step = "1010001"
-  )
+  jrnl_journal(needs_fix_1010001, budget = available_1010001, step = "1010001")
 ```
 
 400476
 
 ```{r}
 journal_400476 <-
-  jrnl_journal(
-    needs_fix_400476,
-    budget = available_400476, step = "400476"
-  )
+  jrnl_journal(needs_fix_400476, budget = available_400476, step = "400476")
 ```
 
 Combined
 
 ```{r}
-journal <-
-  bind_rows(
-    journal_1010212,
-    journal_1010001,
-    journal_400476
-  )
+journal <- bind_rows(journal_1010212, journal_1010001, journal_400476)
 
 journal %>% write_csv("journal.csv", na = "")
 ```
@@ -408,4 +393,8 @@ journal %>%
 supporting_485 %>%
   pull(AMTTOT) %>%
   sum()
+
+journal %>%
+  count(from_program_id, from_costcenter_id, from_account_id, sort = T) %>%
+  filter(n > 1)
 ```
