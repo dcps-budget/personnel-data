@@ -47,7 +47,9 @@ data_485 <-
   relocate(account_id, .after = costcenter_id)
 
 data_025 <-
-  read_xlsx("r025.xlsx", col_types = c(rep("text", 7), rep("numeric", 9))) %>%
+  read_xlsx("r025.xlsx", col_types = c(rep("text", 28), rep("numeric", 8))) %>%
+  rename(available = `Available Budget`) %>% 
+  mutate(spend = Commitment + Obligation + Expenditure) %>% 
   select(agency, ends_with("_id"), available, spend_todate = spend) %>%
   rename_with(.fn = \(x) str_c(x, "_budget"), .cols = ends_with("id"))
 
@@ -77,7 +79,7 @@ available <-
   select(!change) %>%
   #
   mutate(
-    spend_addl_expected = (spend_todate / 9.0) * 3.0,
+    spend_addl_expected = (spend_todate / 10.0) * 2.0,
     available_yearend = available - spend_addl_expected
   ) %>%
   filter(available_yearend > 0.00)
@@ -395,6 +397,8 @@ supporting_485 %>%
   sum()
 
 journal %>%
-  count(from_program_id, from_costcenter_id, from_account_id, sort = T) %>%
-  filter(n > 1)
+  distinct(from_costcenter_id, from_program_id, step) %>% 
+  count(from_costcenter_id, from_program_id, sort = T) %>%
+  filter(n > 1) %>% 
+  arrange(from_costcenter_id, from_program_id)
 ```
